@@ -17,7 +17,7 @@ jobs:
           node-version: 20
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -26,13 +26,16 @@ jobs:
         run: npm install
 
       - name: Generate Android project
-        run: npx expo prebuild --platform android --non-interactive
+        run: CI=1 npx expo prebuild --platform android
 
-      - name: Build APK
-        run: cd android && ./gradlew assembleDebug
+      - name: Build Release APK
+        run: |
+          cd android
+          ./gradlew clean
+          ./gradlew :app:assembleRelease
 
-      - name: Upload APK
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: episodevault-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: episodevault-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
