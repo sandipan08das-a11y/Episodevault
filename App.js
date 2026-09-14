@@ -10,6 +10,7 @@ import {
   Image,
   ActivityIndicator,
   Linking,
+  ScrollView,
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import { createClient } from "@supabase/supabase-js";
@@ -31,6 +32,8 @@ const PRICE = 20;
 export default function App() {
   const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [role, setRole] = useState("user");
+  const [profileName, setProfileName] = useState("");
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -46,6 +49,12 @@ export default function App() {
   const [screenshot, setScreenshot] = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // ADMIN
+  const [adminPayments, setAdminPayments] = useState([]);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [selectedPayment, setSelectedPayment] = useState(null);
+  const [signedScreenshotUrl, setSignedScreenshotUrl] = useState(null);
+
   useEffect(() => {
     getSession();
 
@@ -53,6 +62,11 @@ export default function App() {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, newSession) => {
       setSession(newSession);
+
+      if (!newSession) {
+        setRole("user");
+        setProfileName("");
+      }
     });
 
     return () => subscription.unsubscribe();
@@ -60,11 +74,21 @@ export default function App() {
 
   useEffect(() => {
     if (session) {
+      loadProfile();
+    }
+  }, [session]);
+
+  useEffect(() => {
+    if (session && role === "user") {
       loadEpisodes();
       loadPurchases();
       loadPayments();
     }
-  }, [session]);
+
+    if (session && role === "admin") {
+      loadAdminPayments();
+    }
+  }, [session, role]);
 
   async function getSession() {
     const {
@@ -72,6 +96,29 @@ export default function App() {
     } = await supabase.auth.getSession();
 
     setSession(session);
+
+    if (!session) {
+      setLoading(false);
+    }
+  }
+
+  async function loadProfile() {
+    if (!session) return;
+
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("role, full_name")
+      .eq("id", session.user.id)
+      .single();
+
+    if (error) {
+      console.log("Profile error:", error.message);
+      setLoading(false);
+      return;
+    }
+
+    setRole(data?.role || "user");
+    setProfileName(data?.full_name || "");
     setLoading(false);
   }
 
@@ -122,7 +169,13 @@ export default function App() {
 
   async function logout() {
     await supabase.auth.signOut();
+
+    setSession(null);
+    setRole("user");
+    setProfileName("");
   }
+
+  // ================= USER FUNCTIONS =================
 
   async function loadEpisodes() {
     const { data, error } = await supabase
@@ -140,6 +193,8 @@ export default function App() {
   }
 
   async function loadPurchases() {
+    if (!session) return;
+
     const { data, error } = await supabase
       .from("purchases")
       .select("episode_id")
@@ -151,6 +206,8 @@ export default function App() {
   }
 
   async function loadPayments() {
+    if (!session) return;
+
     const { data, error } = await supabase
       .from("payment_requests")
       .select("*")
@@ -246,12 +303,8 @@ export default function App() {
         throw uploadError;
       }
 
-      const {
-        data: { publicUrl },
-      } = supabase.storage
-        .from("payment-screenshots")
-        .getPublicUrl(fileName);
-
+      // Private bucket ke liye public URL use nahi karenge.
+      // Database mein storage path save hoga.
       const { error: paymentError } = await supabase
         .from("payment_requests")
         .insert({
@@ -259,7 +312,7 @@ export default function App() {
           episode_id: selectedEpisode.id,
           amount: PRICE,
           utr: utr.trim(),
-          screenshot_url: publicUrl,
+          screenshot_url: fileName,
           status: "pending",
         });
 
@@ -305,14 +358,230 @@ export default function App() {
     });
   }
 
+  // ================= ADMIN FUNCTIONS =================
+
+  async function loadAdminPayments() {
+    if (!session || role !== "admin") return;
+
+    try {
+      setAdminLoading(true);
+
+      const { data, error } = await supabase
+        .from("payment_requests")
+        .select(`
+          *,
+          episodes (
+            episode_number,
+            title,
+            price
+          ),
+          profiles (
+            full_name
+          )
+        `)
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        Alert.alert("Admin Error", error.message);
+        return;
+      }
+
+      setAdminPayments(data || []);
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  function getStoragePath(value) {
+    if (!value) return null;
+
+    // New records already contain the storage path.
+    if (!value.startsWith("http")) {
+      return value;
+    }
+
+    // Old records may contain the previous public URL.
+    const marker =
+      "/object/public/payment-screenshots/";
+
+    if (value.includes(marker)) {
+      return decodeURIComponent(
+        value.split(marker)[1]
+      );
+    }
+
+    return null;
+  }
+
+  async function viewScreenshot(payment) {
+    const path = getStoragePath(payment.screenshot_url);
+
+    if (!path) {
+      Alert.alert(
+        "Screenshot Error",
+        "Screenshot file path nahi mila."
+      );
+      return;
+    }
+
+    try {
+      const { data, error } = await supabase.storage
+        .from("payment-screenshots")
+        .createSignedUrl(path, 3600);
+
+      if (error) {
+        Alert.alert("Screenshot Error", error.message);
+        return;
+      }
+
+      setSelectedPayment(payment);
+      setSignedScreenshotUrl(data?.signedUrl || null);
+    } catch (error) {
+      Alert.alert(
+        "Error",
+        error.message || "Screenshot open nahi ho paya."
+      );
+    }
+  }
+
+  async function approvePayment(payment) {
+    Alert.alert(
+      "Approve Payment",
+      `Episode ${payment.episodes?.episode_number} ka payment approve karna hai?`,
+      [
+        {
+          text: "Cancel",
+          style: "cancel",
+        },
+        {
+          text: "Approve",
+          onPress: async () => {
+            try {
+              setAdminLoading(true);
+
+              // Pehle purchase create karo.
+              const { error: purchaseError } =
+                await supabase
+                  .from("purchases")
+                  .insert({
+                    user_id: payment.user_id,
+                    episode_id: payment.episode_id,
+                    payment_request_id: payment.id,
+                    amount: payment.amount,
+                  });
+
+              // Agar already purchased hai toh duplicate error ignore.
+              if (
+                purchaseError &&
+                !purchaseError.message
+                  .toLowerCase()
+                  .includes("duplicate")
+              ) {
+                throw purchaseError;
+              }
+
+              // Phir payment approve karo.
+              const { error: updateError } =
+                await supabase
+                  .from("payment_requests")
+                  .update({
+                    status: "approved",
+                    reviewed_at: new Date().toISOString(),
+                  })
+                  .eq("id", payment.id);
+
+              if (updateError) {
+                throw updateError;
+              }
+
+              Alert.alert(
+                "Approved",
+                "Payment approve ho gaya aur episode unlock ho gaya."
+              );
+
+              setSelectedPayment(null);
+              setSignedScreenshotUrl(null);
+
+              await loadAdminPayments();
+            } catch (error) {
+              Alert.alert(
+                "Approval Failed",
+                error.message || "Something went wrong."
+              );
+            } finally {
+              setAdminLoading(false);
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  async function rejectPayment(payment) {
+    Alert.alert(
+      "Reject Payment",
+      `Episode ${payment.episodes?.episode_number} ka payment reject karna hai?`,
+      [
+        {
+          text: "Cancel",
+          style: "cancel",
+        },
+        {
+          text: "Reject",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              setAdminLoading(true);
+
+              const { error } = await supabase
+                .from("payment_requests")
+                .update({
+                  status: "rejected",
+                  reviewed_at: new Date().toISOString(),
+                })
+                .eq("id", payment.id);
+
+              if (error) {
+                throw error;
+              }
+
+              Alert.alert(
+                "Rejected",
+                "Payment request reject kar diya gaya."
+              );
+
+              setSelectedPayment(null);
+              setSignedScreenshotUrl(null);
+
+              await loadAdminPayments();
+            } catch (error) {
+              Alert.alert(
+                "Reject Failed",
+                error.message || "Something went wrong."
+              );
+            } finally {
+              setAdminLoading(false);
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  // ================= LOADING =================
+
   if (loading) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator size="large" />
-        <Text style={styles.loadingText}>Loading...</Text>
+        <ActivityIndicator size="large" color="#fff" />
+        <Text style={styles.loadingText}>
+          Loading...
+        </Text>
       </View>
     );
   }
+
+  // ================= LOGIN =================
 
   if (!session) {
     return (
@@ -320,7 +589,9 @@ export default function App() {
         <StatusBar style="light" />
 
         <View style={styles.authBox}>
-          <Text style={styles.logo}>EpisodeVault</Text>
+          <Text style={styles.logo}>
+            EpisodeVault
+          </Text>
 
           <Text style={styles.subtitle}>
             Watch premium episodes
@@ -378,8 +649,113 @@ export default function App() {
     );
   }
 
-  if (selectedEpisode) {
-    const pending = getPaymentForEpisode(selectedEpisode.id);
+  // ================= SCREENSHOT MODAL =================
+
+  if (
+    role === "admin" &&
+    selectedPayment &&
+    signedScreenshotUrl
+  ) {
+    return (
+      <View style={styles.container}>
+        <StatusBar style="light" />
+
+        <TouchableOpacity
+          onPress={() => {
+            setSelectedPayment(null);
+            setSignedScreenshotUrl(null);
+          }}
+          style={styles.backButton}
+        >
+          <Text style={styles.backText}>
+            ‹ Back
+          </Text>
+        </TouchableOpacity>
+
+        <Text style={styles.pageTitle}>
+          Payment Screenshot
+        </Text>
+
+        <ScrollView
+          contentContainerStyle={styles.screenshotContainer}
+        >
+          <Image
+            source={{ uri: signedScreenshotUrl }}
+            style={styles.fullScreenshot}
+            resizeMode="contain"
+          />
+
+          <View style={styles.adminInfoCard}>
+            <Text style={styles.infoLabel}>
+              User
+            </Text>
+
+            <Text style={styles.infoValue}>
+              {selectedPayment.profiles?.full_name ||
+                "User"}
+            </Text>
+
+            <Text style={styles.infoLabel}>
+              Episode
+            </Text>
+
+            <Text style={styles.infoValue}>
+              EP {selectedPayment.episodes?.episode_number} —{" "}
+              {selectedPayment.episodes?.title}
+            </Text>
+
+            <Text style={styles.infoLabel}>
+              UTR
+            </Text>
+
+            <Text style={styles.infoValue}>
+              {selectedPayment.utr}
+            </Text>
+
+            <Text style={styles.infoLabel}>
+              Amount
+            </Text>
+
+            <Text style={styles.infoValue}>
+              ₹{selectedPayment.amount}
+            </Text>
+          </View>
+
+          {selectedPayment.status === "pending" && (
+            <View style={styles.adminActionRow}>
+              <TouchableOpacity
+                style={styles.approveButton}
+                onPress={() =>
+                  approvePayment(selectedPayment)
+                }
+              >
+                <Text style={styles.actionButtonText}>
+                  ✓ Approve
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.rejectButton}
+                onPress={() =>
+                  rejectPayment(selectedPayment)
+                }
+              >
+                <Text style={styles.actionButtonText}>
+                  ✕ Reject
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </ScrollView>
+      </View>
+    );
+  }
+
+  // ================= USER PAYMENT SCREEN =================
+
+  if (role === "user" && selectedEpisode) {
+    const pending =
+      getPaymentForEpisode(selectedEpisode.id);
 
     return (
       <View style={styles.container}>
@@ -389,96 +765,306 @@ export default function App() {
           onPress={() => setSelectedEpisode(null)}
           style={styles.backButton}
         >
-          <Text style={styles.backText}>‹ Back</Text>
+          <Text style={styles.backText}>
+            ‹ Back
+          </Text>
         </TouchableOpacity>
 
-        <Text style={styles.pageTitle}>
-          Unlock Episode {selectedEpisode.episode_number}
-        </Text>
-
-        <View style={styles.paymentCard}>
-          <Text style={styles.episodeTitle}>
-            {selectedEpisode.title}
+        <ScrollView>
+          <Text style={styles.pageTitle}>
+            Unlock Episode{" "}
+            {selectedEpisode.episode_number}
           </Text>
 
-          <Text style={styles.price}>₹{PRICE}</Text>
-
-          <Text style={styles.instruction}>
-            Step 1: ₹{PRICE} payment karo
-          </Text>
-
-          <Text style={styles.upiLabel}>UPI ID</Text>
-
-          <View style={styles.upiBox}>
-            <Text style={styles.upiText}>{UPI_ID}</Text>
-          </View>
-
-          <TouchableOpacity
-            style={styles.upiButton}
-            onPress={openUPI}
-          >
-            <Text style={styles.buttonText}>
-              Pay ₹{PRICE} via UPI
+          <View style={styles.paymentCard}>
+            <Text style={styles.episodeTitle}>
+              {selectedEpisode.title}
             </Text>
-          </TouchableOpacity>
 
-          <Text style={styles.instruction}>
-            Step 2: Payment ke baad UTR / Transaction ID enter karo
-          </Text>
-
-          <TextInput
-            placeholder="Enter UTR / Transaction ID"
-            placeholderTextColor="#777"
-            style={styles.input}
-            value={utr}
-            onChangeText={setUtr}
-          />
-
-          <Text style={styles.instruction}>
-            Step 3: Payment screenshot upload karo
-          </Text>
-
-          <TouchableOpacity
-            style={styles.secondaryButton}
-            onPress={chooseScreenshot}
-          >
-            <Text style={styles.secondaryText}>
-              {screenshot
-                ? "Screenshot Selected ✓"
-                : "Select Payment Screenshot"}
+            <Text style={styles.price}>
+              ₹{PRICE}
             </Text>
-          </TouchableOpacity>
 
-          {screenshot && (
-            <Image
-              source={{ uri: screenshot.uri }}
-              style={styles.preview}
-            />
-          )}
+            <Text style={styles.instruction}>
+              Step 1: ₹{PRICE} payment karo
+            </Text>
 
-          {pending ? (
-            <View style={styles.pendingBox}>
-              <Text style={styles.pendingText}>
-                ⏳ Payment verification pending
+            <Text style={styles.upiLabel}>
+              UPI ID
+            </Text>
+
+            <View style={styles.upiBox}>
+              <Text style={styles.upiText}>
+                {UPI_ID}
               </Text>
             </View>
-          ) : (
+
             <TouchableOpacity
-              style={styles.primaryButton}
-              onPress={submitPayment}
-              disabled={submitting}
+              style={styles.upiButton}
+              onPress={openUPI}
             >
               <Text style={styles.buttonText}>
-                {submitting
-                  ? "Submitting..."
-                  : "Submit Payment"}
+                Pay ₹{PRICE} via UPI
               </Text>
             </TouchableOpacity>
-          )}
-        </View>
+
+            <Text style={styles.instruction}>
+              Step 2: Payment ke baad UTR /
+              Transaction ID enter karo
+            </Text>
+
+            <TextInput
+              placeholder="Enter UTR / Transaction ID"
+              placeholderTextColor="#777"
+              style={styles.input}
+              value={utr}
+              onChangeText={setUtr}
+            />
+
+            <Text style={styles.instruction}>
+              Step 3: Payment screenshot upload karo
+            </Text>
+
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={chooseScreenshot}
+            >
+              <Text style={styles.secondaryText}>
+                {screenshot
+                  ? "Screenshot Selected ✓"
+                  : "Select Payment Screenshot"}
+              </Text>
+            </TouchableOpacity>
+
+            {screenshot && (
+              <Image
+                source={{ uri: screenshot.uri }}
+                style={styles.preview}
+              />
+            )}
+
+            {pending ? (
+              <View style={styles.pendingBox}>
+                <Text style={styles.pendingText}>
+                  ⏳ Payment verification pending
+                </Text>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.primaryButton}
+                onPress={submitPayment}
+                disabled={submitting}
+              >
+                <Text style={styles.buttonText}>
+                  {submitting
+                    ? "Submitting..."
+                    : "Submit Payment"}
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </ScrollView>
       </View>
     );
   }
+
+  // ================= ADMIN DASHBOARD =================
+
+  if (role === "admin") {
+    const pendingCount =
+      adminPayments.filter(
+        (item) => item.status === "pending"
+      ).length;
+
+    const approvedCount =
+      adminPayments.filter(
+        (item) => item.status === "approved"
+      ).length;
+
+    const rejectedCount =
+      adminPayments.filter(
+        (item) => item.status === "rejected"
+      ).length;
+
+    return (
+      <View style={styles.container}>
+        <StatusBar style="light" />
+
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.adminBadge}>
+              ADMIN PANEL
+            </Text>
+
+            <Text style={styles.logoSmall}>
+              EpisodeVault
+            </Text>
+
+            <Text style={styles.welcome}>
+              Welcome, {profileName || "Admin"}
+            </Text>
+          </View>
+
+          <TouchableOpacity onPress={logout}>
+            <Text style={styles.logout}>
+              Logout
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.statsRow}>
+          <View style={styles.statCard}>
+            <Text style={styles.statNumber}>
+              {pendingCount}
+            </Text>
+            <Text style={styles.statLabel}>
+              Pending
+            </Text>
+          </View>
+
+          <View style={styles.statCard}>
+            <Text style={styles.statNumber}>
+              {approvedCount}
+            </Text>
+            <Text style={styles.statLabel}>
+              Approved
+            </Text>
+          </View>
+
+          <View style={styles.statCard}>
+            <Text style={styles.statNumber}>
+              {rejectedCount}
+            </Text>
+            <Text style={styles.statLabel}>
+              Rejected
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.adminHeaderRow}>
+          <Text style={styles.adminTitle}>
+            Payment Requests
+          </Text>
+
+          <TouchableOpacity
+            onPress={loadAdminPayments}
+          >
+            <Text style={styles.refresh}>
+              ↻ Refresh
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {adminLoading && (
+          <ActivityIndicator
+            size="small"
+            color="#fff"
+            style={{ marginBottom: 10 }}
+          />
+        )}
+
+        <FlatList
+          data={adminPayments}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.list}
+          ListEmptyComponent={
+            <Text style={styles.empty}>
+              No payment requests yet.
+            </Text>
+          }
+          renderItem={({ item }) => (
+            <View style={styles.adminPaymentCard}>
+              <View style={styles.adminPaymentTop}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.adminEpisode}>
+                    EPISODE{" "}
+                    {item.episodes?.episode_number}
+                  </Text>
+
+                  <Text style={styles.adminEpisodeTitle}>
+                    {item.episodes?.title ||
+                      "Episode"}
+                  </Text>
+                </View>
+
+                <View
+                  style={[
+                    styles.statusBadge,
+                    item.status === "pending"
+                      ? styles.pendingBadge
+                      : item.status === "approved"
+                      ? styles.approvedBadge
+                      : styles.rejectedBadge,
+                  ]}
+                >
+                  <Text style={styles.statusText}>
+                    {item.status.toUpperCase()}
+                  </Text>
+                </View>
+              </View>
+
+              <Text style={styles.adminUser}>
+                👤{" "}
+                {item.profiles?.full_name ||
+                  "Unknown User"}
+              </Text>
+
+              <Text style={styles.adminUtr}>
+                UTR: {item.utr}
+              </Text>
+
+              <Text style={styles.adminAmount}>
+                ₹{item.amount}
+              </Text>
+
+              <TouchableOpacity
+                style={styles.viewButton}
+                onPress={() =>
+                  viewScreenshot(item)
+                }
+              >
+                <Text style={styles.buttonText}>
+                  🖼 View Screenshot
+                </Text>
+              </TouchableOpacity>
+
+              {item.status === "pending" && (
+                <View style={styles.adminActionRow}>
+                  <TouchableOpacity
+                    style={styles.approveButton}
+                    onPress={() =>
+                      approvePayment(item)
+                    }
+                  >
+                    <Text
+                      style={styles.actionButtonText}
+                    >
+                      ✓ Approve
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.rejectButton}
+                    onPress={() =>
+                      rejectPayment(item)
+                    }
+                  >
+                    <Text
+                      style={styles.actionButtonText}
+                    >
+                      ✕ Reject
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          )}
+        />
+      </View>
+    );
+  }
+
+  // ================= USER HOME =================
 
   return (
     <View style={styles.container}>
@@ -486,14 +1072,19 @@ export default function App() {
 
       <View style={styles.header}>
         <View>
-          <Text style={styles.logoSmall}>EpisodeVault</Text>
+          <Text style={styles.logoSmall}>
+            EpisodeVault
+          </Text>
+
           <Text style={styles.welcome}>
             Premium Episodes
           </Text>
         </View>
 
         <TouchableOpacity onPress={logout}>
-          <Text style={styles.logout}>Logout</Text>
+          <Text style={styles.logout}>
+            Logout
+          </Text>
         </TouchableOpacity>
       </View>
 
@@ -508,7 +1099,8 @@ export default function App() {
         }
         renderItem={({ item }) => {
           const unlocked = isPurchased(item.id);
-          const pending = getPaymentForEpisode(item.id);
+          const pending =
+            getPaymentForEpisode(item.id);
 
           return (
             <View style={styles.card}>
@@ -518,8 +1110,12 @@ export default function App() {
                   style={styles.thumbnail}
                 />
               ) : (
-                <View style={styles.thumbnailPlaceholder}>
-                  <Text style={styles.playIcon}>▶</Text>
+                <View
+                  style={styles.thumbnailPlaceholder}
+                >
+                  <Text style={styles.playIcon}>
+                    ▶
+                  </Text>
                 </View>
               )}
 
@@ -565,10 +1161,13 @@ export default function App() {
                 ) : (
                   <TouchableOpacity
                     style={styles.primaryButton}
-                    onPress={() => openPaymentScreen(item)}
+                    onPress={() =>
+                      openPaymentScreen(item)
+                    }
                   >
                     <Text style={styles.buttonText}>
-                      🔒 Unlock for ₹{item.price || PRICE}
+                      🔒 Unlock for ₹
+                      {item.price || PRICE}
                     </Text>
                   </TouchableOpacity>
                 )}
@@ -858,5 +1457,200 @@ const styles = StyleSheet.create({
     height: 180,
     borderRadius: 12,
     marginTop: 12,
+  },
+
+  // ADMIN STYLES
+
+  adminBadge: {
+    color: "#aaa",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 1.5,
+    marginBottom: 4,
+  },
+
+  statsRow: {
+    flexDirection: "row",
+    paddingHorizontal: 16,
+    gap: 10,
+    marginBottom: 20,
+  },
+
+  statCard: {
+    flex: 1,
+    backgroundColor: "#151515",
+    borderRadius: 14,
+    padding: 15,
+    borderWidth: 1,
+    borderColor: "#252525",
+    alignItems: "center",
+  },
+
+  statNumber: {
+    color: "#fff",
+    fontSize: 25,
+    fontWeight: "800",
+  },
+
+  statLabel: {
+    color: "#777",
+    marginTop: 4,
+    fontSize: 12,
+  },
+
+  adminHeaderRow: {
+    paddingHorizontal: 20,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 5,
+  },
+
+  adminTitle: {
+    color: "#fff",
+    fontSize: 20,
+    fontWeight: "800",
+  },
+
+  refresh: {
+    color: "#aaa",
+    fontWeight: "600",
+  },
+
+  adminPaymentCard: {
+    backgroundColor: "#151515",
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: "#252525",
+  },
+
+  adminPaymentTop: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+  },
+
+  adminEpisode: {
+    color: "#777",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 1,
+  },
+
+  adminEpisodeTitle: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 5,
+  },
+
+  statusBadge: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 8,
+  },
+
+  pendingBadge: {
+    backgroundColor: "#38301b",
+  },
+
+  approvedBadge: {
+    backgroundColor: "#1c3624",
+  },
+
+  rejectedBadge: {
+    backgroundColor: "#3a2020",
+  },
+
+  statusText: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "800",
+  },
+
+  adminUser: {
+    color: "#aaa",
+    marginTop: 14,
+  },
+
+  adminUtr: {
+    color: "#888",
+    marginTop: 7,
+  },
+
+  adminAmount: {
+    color: "#fff",
+    fontSize: 20,
+    fontWeight: "800",
+    marginTop: 10,
+  },
+
+  viewButton: {
+    backgroundColor: "#fff",
+    borderRadius: 10,
+    padding: 13,
+    alignItems: "center",
+    marginTop: 14,
+  },
+
+  adminActionRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 12,
+  },
+
+  approveButton: {
+    flex: 1,
+    backgroundColor: "#fff",
+    borderRadius: 10,
+    padding: 13,
+    alignItems: "center",
+  },
+
+  rejectButton: {
+    flex: 1,
+    backgroundColor: "#333",
+    borderRadius: 10,
+    padding: 13,
+    alignItems: "center",
+  },
+
+  actionButtonText: {
+    color: "#000",
+    fontWeight: "800",
+  },
+
+  fullScreenshot: {
+    width: "100%",
+    height: 430,
+    backgroundColor: "#151515",
+    borderRadius: 14,
+  },
+
+  screenshotContainer: {
+    padding: 16,
+    paddingBottom: 50,
+  },
+
+  adminInfoCard: {
+    backgroundColor: "#151515",
+    borderRadius: 14,
+    padding: 16,
+    marginTop: 15,
+  },
+
+  infoLabel: {
+    color: "#777",
+    fontSize: 11,
+    marginTop: 10,
+    textTransform: "uppercase",
+  },
+
+  infoValue: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "600",
+    marginTop: 4,
   },
 });
