@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Episode Vault",
+    "slug": "episode-vault",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "episodevault",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.episodevault.app",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#090909"
+      }
+    },
+    "plugins": [
+      "expo-video",
+      "expo-document-picker",
+      "expo-image-picker"
+    ],
+    "assetBundlePatterns": ["**/*"]
+  }
+}
